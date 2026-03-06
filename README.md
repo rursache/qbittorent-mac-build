@@ -14,13 +14,20 @@ Or build from qBittorrent's `master` branch (bleeding edge):
 curl -fsSL https://raw.githubusercontent.com/rursache/qbittorent-mac-build/master/build-qbittorrent.sh | bash -s -- --master
 ```
 
+Or spoof the tracker version (e.g. build master but report as 5.0.5 to trackers):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/rursache/qbittorent-mac-build/master/build-qbittorrent.sh | bash -s -- --master --spoof 5.0.5
+```
+
 ## Manual Usage
 
 ```bash
 git clone https://github.com/rursache/qbittorent-mac-build.git
 cd qbittorent-mac-build
-./build-qbittorrent.sh            # builds latest release tag
-./build-qbittorrent.sh --master   # builds master branch
+./build-qbittorrent.sh                        # builds latest release tag
+./build-qbittorrent.sh --master               # builds master branch
+./build-qbittorrent.sh --master --spoof 5.0.5 # builds master, trackers see v5.0.5
 ```
 
 The resulting `qBittorrent.app` will be placed next to the script.
@@ -52,3 +59,4 @@ The build directory is automatically cleaned up after the `.app` is copied out.
 - The script always auto-detects the **latest** qBittorrent release tag and libtorrent 2.0.x tag from GitHub. Hardcoded fallback versions are used only if the lookup fails.
 - No signing identity is needed. The app is ad-hoc signed (`codesign --sign -`) which is sufficient for local use.
 - Every build is a clean build from scratch.
+- **Version spoofing**: Use `--spoof X.Y.Z` to make the client report a different version to trackers (peer ID and user-agent). This is useful when trackers whitelist only specific versions. The About dialog and all other UI will still show the real version.

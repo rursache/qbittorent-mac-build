@@ -5,8 +5,9 @@ set -euo pipefail
 # Build qBittorrent for macOS from source
 # Produces: qBittorrent.app next to this script
 #
-# Usage:   ./build-qbittorrent.sh            # builds latest release tag
-#          ./build-qbittorrent.sh --master    # builds master branch
+# Usage:   ./build-qbittorrent.sh                          # builds latest release tag
+#          ./build-qbittorrent.sh --master                 # builds master branch
+#          ./build-qbittorrent.sh --master --spoof 5.0.5   # builds master, trackers see 5.0.5
 # Prereqs: Xcode CLI tools, Homebrew
 # Time:    ~2-3 minutes on Apple Silicon (M4)
 # =============================================================================
@@ -19,14 +20,32 @@ LIBTORRENT_VERSION="v2.0.11"  # fallback
 QBITTORRENT_TAG="release-5.1.4"  # fallback
 
 # Parse arguments
-for arg in "$@"; do
-    case "$arg" in
-        --master) ;;
-        *) echo "Unknown option: $arg"; echo "Usage: $0 [--master]"; exit 1 ;;
+USE_MASTER=false
+SPOOF_VERSION=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --master)
+            USE_MASTER=true
+            shift
+            ;;
+        --spoof)
+            shift
+            SPOOF_VERSION="${1:-}"
+            if [[ -z "$SPOOF_VERSION" ]] || ! [[ "$SPOOF_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "Error: --spoof requires a version in X.Y.Z format (e.g. 5.0.5)"
+                exit 1
+            fi
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--master] [--spoof X.Y.Z]"
+            exit 1
+            ;;
     esac
 done
 
-if [[ " $* " == *" --master "* ]]; then
+if $USE_MASTER; then
     QBITTORRENT_BRANCH="master"
     QBITTORRENT_CLONE_ARGS=(--depth 1 --branch master)
     info_branch="master"
@@ -64,7 +83,11 @@ error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 # -----------------------------------------------------------------------------
 # Step 1: Install Homebrew dependencies
 # -----------------------------------------------------------------------------
-info "Building qBittorrent: $info_branch"
+if [[ -n "$SPOOF_VERSION" ]]; then
+    info "Building qBittorrent: $info_branch (tracker spoof: $SPOOF_VERSION)"
+else
+    info "Building qBittorrent: $info_branch"
+fi
 info "Step 1/5: Installing Homebrew dependencies..."
 
 BREW_DEPS="cmake ninja qt openssl@3 zlib boost pkg-config"
@@ -122,6 +145,33 @@ info "Step 4/5: Building qBittorrent ($info_branch)..."
 git clone "${QBITTORRENT_CLONE_ARGS[@]}" \
     https://github.com/qbittorrent/qBittorrent.git "$WORKDIR/qBittorrent"
 
+# Patch tracker-reported version if --spoof is set
+# This only changes the peer_fingerprint (peer ID) and HTTP user_agent sent to
+# trackers. The About dialog and all other UI keep showing the real version.
+if [[ -n "$SPOOF_VERSION" ]]; then
+    info "  Patching tracker version to $SPOOF_VERSION..."
+    SPOOF_MAJOR="${SPOOF_VERSION%%.*}"
+    SPOOF_REST="${SPOOF_VERSION#*.}"
+    SPOOF_MINOR="${SPOOF_REST%%.*}"
+    SPOOF_BUGFIX="${SPOOF_REST#*.}"
+
+    SESSION_FILE="$WORKDIR/qBittorrent/src/base/bittorrent/sessionimpl.cpp"
+
+    # Replace peer fingerprint: generate_fingerprint("qB", MAJOR, MINOR, BUGFIX, BUILD)
+    # with hardcoded spoofed values
+    sed -i '' -E \
+        "s|generate_fingerprint\(PEER_ID, QBT_VERSION_MAJOR, QBT_VERSION_MINOR, QBT_VERSION_BUGFIX, QBT_VERSION_BUILD\)|generate_fingerprint(PEER_ID, ${SPOOF_MAJOR}, ${SPOOF_MINOR}, ${SPOOF_BUGFIX}, 0)|" \
+        "$SESSION_FILE"
+
+    # Replace user-agent: "qBittorrent/" QBT_VERSION_2 → "qBittorrent/SPOOF_VERSION"
+    sed -i '' -E \
+        "s|QStringLiteral\(\"qBittorrent/\" QBT_VERSION_2\)|QStringLiteral(\"qBittorrent/${SPOOF_VERSION}\")|" \
+        "$SESSION_FILE"
+
+    info "  Peer ID spoofed to: qB ${SPOOF_MAJOR}.${SPOOF_MINOR}.${SPOOF_BUGFIX}.0"
+    info "  User-Agent spoofed to: qBittorrent/${SPOOF_VERSION}"
+fi
+
 cmake -S "$WORKDIR/qBittorrent" -B "$WORKDIR/qBittorrent/build" \
     -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
@@ -168,6 +218,9 @@ info "  Build complete! (${MINS}m ${SECS}s)"
 info "========================================"
 info ""
 info "  .app: $FINAL_APP"
+if [[ -n "$SPOOF_VERSION" ]]; then
+    info "  Tracker version: $SPOOF_VERSION (spoofed)"
+fi
 info ""
 info "  To install:"
 info "    cp -R \"$FINAL_APP\" /Applications/"
