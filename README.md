@@ -5,13 +5,13 @@ qBittorrent macOS builds are no longer being published but you can now make your
 ## One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rursache/qbittorent-mac-build/main/build-qbittorrent.sh | bash
+curl -fsSL https://raw.githubusercontent.com/rursache/qbittorent-mac-build/master/build-qbittorrent.sh | bash
 ```
 
-Or build from the `master` branch:
+Or build from qBittorrent's `master` branch (bleeding edge):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/rursache/qbittorent-mac-build/main/build-qbittorrent.sh | bash -s -- --master
+curl -fsSL https://raw.githubusercontent.com/rursache/qbittorent-mac-build/master/build-qbittorrent.sh | bash -s -- --master
 ```
 
 ## Manual Usage
