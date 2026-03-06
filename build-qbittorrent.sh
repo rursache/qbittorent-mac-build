@@ -12,7 +12,7 @@ set -euo pipefail
 # =============================================================================
 
 START_TIME=$(date +%s)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 NPROC=$(sysctl -n hw.ncpu)
 WORKDIR="$(pwd)/qbt-build"
 LIBTORRENT_VERSION="v2.0.11"  # fallback
