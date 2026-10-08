@@ -53,7 +53,7 @@ else
     # Fetch the latest release-* tag from GitHub
     LATEST_TAG=$(git ls-remote --tags --sort=-v:refname \
         https://github.com/qbittorrent/qBittorrent.git 'refs/tags/release-*' \
-        | head -n1 | sed 's|.*/||')
+        | sed 's|.*/||' | awk '/^release-[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found=1 }')
     if [ -n "$LATEST_TAG" ]; then
         QBITTORRENT_TAG="$LATEST_TAG"
     fi
@@ -65,7 +65,7 @@ fi
 # Fetch the latest libtorrent 2.0.x tag from GitHub
 LATEST_LT=$(git ls-remote --tags --sort=-v:refname \
     https://github.com/arvidn/libtorrent.git 'refs/tags/v2.0.*' \
-    | grep -v '\^{}' | head -n1 | sed 's|.*/||')
+    | sed 's|.*/||' | awk '/^v2\.0\.[0-9]+$/ && !found { print; found=1 }')
 if [ -n "$LATEST_LT" ]; then
     LIBTORRENT_VERSION="$LATEST_LT"
 fi
@@ -96,7 +96,7 @@ for dep in $BREW_DEPS; do
         info "  $dep already installed"
     else
         info "  Installing $dep..."
-        brew install "$dep"
+        brew install "$dep" </dev/null
     fi
 done
 
