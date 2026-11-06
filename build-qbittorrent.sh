@@ -1,32 +1,21 @@
 #!/bin/bash
 set -euo pipefail
 
-# Wrapped in main() so `curl | bash` parses the whole script before running anything:
-# a truncated download fails instead of running half, and no command can eat the rest from stdin
 main() {
-
-# =============================================================================
-# Build qBittorrent for macOS from source
-# Produces: qBittorrent.app next to this script, or in the current directory when piped
-#
-# Usage:   ./build-qbittorrent.sh                          # builds latest release tag
-#          ./build-qbittorrent.sh --master                 # builds master branch
-#          ./build-qbittorrent.sh --master --spoof 5.0.5   # builds master, trackers see 5.0.5
-#          ./build-qbittorrent.sh --libtorrent 2.1.2       # pins a specific libtorrent version
-# Prereqs: Xcode CLI tools, Homebrew
-# Time:    ~1.5 minutes on Apple Silicon (M4), a bit more with --master
-# =============================================================================
 
 START_TIME=$(date +%s)
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     OUTPUT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 else
-    # Piped from curl, put the app in the caller's cwd
     OUTPUT_DIR="$PWD"
 fi
 NPROC=$(sysctl -n hw.ncpu)
-LIBTORRENT_VERSION="v2.0.15"     # fallback
-QBITTORRENT_TAG="release-5.2.4"  # fallback
+ARCH=$(uname -m)
+LIBTORRENT_VERSION="v2.0.15"
+QBITTORRENT_TAG="release-5.3.0"
+QT_VERSION="6.12.0"
+BOOST_VERSION="1.92.0"
+OPENSSL_VERSION="3.6.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,7 +26,6 @@ info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 error() { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
-# Parse arguments
 USE_MASTER=false
 SPOOF_VERSION=""
 LIBTORRENT_OVERRIDE=""
@@ -50,10 +38,9 @@ while [[ $# -gt 0 ]]; do
         --spoof)
             shift
             SPOOF_VERSION="${1:-}"
-            # Each part ends up as a C++ literal and a single peer ID char (0-9, A-Z), so 0-35 without leading zeros
             if ! [[ "$SPOOF_VERSION" =~ ^(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)\.(0|[1-9][0-9]?)$ ]] \
                 || (( BASH_REMATCH[1] > 35 || BASH_REMATCH[2] > 35 || BASH_REMATCH[3] > 35 )); then
-                echo "Error: --spoof requires X.Y.Z with each part 0-35 and no leading zeros (e.g. 5.0.5)"
+                echo "Error: --spoof requires X.Y.Z with each part 0-35 and no leading zeros (e.g. 5.3.0)"
                 exit 1
             fi
             shift
@@ -76,14 +63,81 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+xcode-select -p >/dev/null 2>&1 && xcrun --find clang >/dev/null 2>&1 \
+    || error "Xcode Command Line Tools are missing, run: xcode-select --install"
+/usr/bin/python3 -c 'import venv' >/dev/null 2>&1 \
+    || error "/usr/bin/python3 is not usable, reinstall the Command Line Tools: xcode-select --install"
+
+WORKDIR="$(mktemp -d -t qbt-build)"
+TOOLS="$WORKDIR/tools"
+DEPS="$WORKDIR/deps"
+LOGS="$WORKDIR/logs"
+mkdir -p "$DEPS" "$LOGS"
+
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1" 2>/dev/null); do
+        kill_tree "$child"
+    done
+    kill "$1" 2>/dev/null || true
+}
+cleanup() {
+    local pid
+    for pid in $(jobs -p); do
+        kill_tree "$pid"
+    done
+    wait 2>/dev/null || true
+    cd /
+    rm -rf "$WORKDIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+cd "$WORKDIR"
+
+export PATH="$TOOLS/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+unset CPATH C_INCLUDE_PATH CPLUS_INCLUDE_PATH LIBRARY_PATH PKG_CONFIG_PATH CMAKE_PREFIX_PATH \
+    DYLD_LIBRARY_PATH DYLD_FALLBACK_LIBRARY_PATH CC CXX CFLAGS CXXFLAGS LDFLAGS
+export PYTHONWARNINGS=ignore PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1 PYTHONDONTWRITEBYTECODE=1
+
+start_job() {
+    local name="$1"
+    shift
+    "$@" >"$LOGS/$name.log" 2>&1 &
+    echo $! >"$LOGS/$name.pid"
+}
+wait_job() {
+    local name="$1"
+    if ! wait "$(cat "$LOGS/$name.pid")"; then
+        tail -25 "$LOGS/$name.log" >&2
+        error "Step '$name' failed (log above)"
+    fi
+}
+
+latest_tag() {
+    git ls-remote --tags --sort=-v:refname "$1" "refs/tags/$2" 2>/dev/null \
+        | sed 's|.*/||' | awk -v re="$3" '$0 ~ re && !found { print; found=1 }' || true
+}
+
+info "Looking up the latest versions..."
+
+if $USE_MASTER; then
+    LT_PATTERN='^v2\.[0-9]+\.[0-9]+$'
+else
+    LT_PATTERN='^v2\.0\.[0-9]+$'
+    latest_tag https://github.com/qbittorrent/qBittorrent.git 'release-*' '^release-[0-9]+\.[0-9]+\.[0-9]+$' >"$LOGS/v_qbt" &
+fi
+[[ -z "$LIBTORRENT_OVERRIDE" ]] && latest_tag https://github.com/arvidn/libtorrent.git 'v2.*' "$LT_PATTERN" >"$LOGS/v_lt" &
+latest_tag https://github.com/boostorg/boost.git 'boost-1.*' '^boost-1\.[0-9]+\.[0-9]+$' >"$LOGS/v_boost" &
+latest_tag https://github.com/openssl/openssl.git 'openssl-3.*' '^openssl-3\.[0-9]+\.[0-9]+$' >"$LOGS/v_openssl" &
+wait
+
+lookup() { [[ -s "$LOGS/$1" ]] && cat "$LOGS/$1" || true; }
+
 if $USE_MASTER; then
     QBITTORRENT_CLONE_ARGS=(--depth 1 --branch master)
     info_branch="master"
 else
-    # Fetch the latest stable release-* tag from GitHub
-    LATEST_TAG=$(git ls-remote --tags --sort=-v:refname \
-        https://github.com/qbittorrent/qBittorrent.git 'refs/tags/release-*' \
-        | sed 's|.*/||' | awk '/^release-[0-9]+\.[0-9]+\.[0-9]+$/ && !found { print; found=1 }') || true
+    LATEST_TAG=$(lookup v_qbt)
     if [[ -n "$LATEST_TAG" ]]; then
         QBITTORRENT_TAG="$LATEST_TAG"
     else
@@ -93,19 +147,10 @@ else
     info_branch="$QBITTORRENT_TAG"
 fi
 
-# Pick libtorrent: explicit --libtorrent wins, master gets the latest 2.x,
-# release tags stay on 2.0.x which is what qBittorrent release CI tests against
 if [[ -n "$LIBTORRENT_OVERRIDE" ]]; then
     LIBTORRENT_VERSION="v$LIBTORRENT_OVERRIDE"
 else
-    if $USE_MASTER; then
-        LT_PATTERN='^v2\.[0-9]+\.[0-9]+$'
-    else
-        LT_PATTERN='^v2\.0\.[0-9]+$'
-    fi
-    LATEST_LT=$(git ls-remote --tags --sort=-v:refname \
-        https://github.com/arvidn/libtorrent.git 'refs/tags/v2.*' \
-        | sed 's|.*/||' | awk -v re="$LT_PATTERN" '$0 ~ re && !found { print; found=1 }') || true
+    LATEST_LT=$(lookup v_lt)
     if [[ -n "$LATEST_LT" ]]; then
         LIBTORRENT_VERSION="$LATEST_LT"
     else
@@ -113,151 +158,214 @@ else
     fi
 fi
 
-# -----------------------------------------------------------------------------
-# Step 1: Install Homebrew dependencies
-# -----------------------------------------------------------------------------
+LATEST_BOOST=$(lookup v_boost)
+if [[ -n "$LATEST_BOOST" ]]; then
+    BOOST_VERSION="${LATEST_BOOST#boost-}"
+else
+    warn "Could not look up the latest Boost tag, using fallback $BOOST_VERSION"
+fi
+
+LATEST_OPENSSL=$(lookup v_openssl)
+if [[ -n "$LATEST_OPENSSL" ]]; then
+    OPENSSL_VERSION="${LATEST_OPENSSL#openssl-}"
+else
+    warn "Could not look up the latest OpenSSL tag, using fallback $OPENSSL_VERSION"
+fi
+
+QT_PREFIX="$DEPS/qt"
+BOOST_PREFIX="$DEPS/boost"
+OPENSSL_PREFIX="$DEPS/openssl"
+LT_PREFIX="$DEPS/libtorrent"
+
 if [[ -n "$SPOOF_VERSION" ]]; then
     info "Building qBittorrent: $info_branch with libtorrent $LIBTORRENT_VERSION (tracker spoof: $SPOOF_VERSION)"
 else
     info "Building qBittorrent: $info_branch with libtorrent $LIBTORRENT_VERSION"
 fi
-info "Step 1/5: Installing Homebrew dependencies..."
+info "Everything is built in $WORKDIR and removed when the script exits"
 
-# Only the Qt modules qBittorrent uses, the `qt` meta formula pulls in ~80 formulae including QtWebEngine
-BREW_DEPS=(cmake ninja qtbase qtsvg qttools qttranslations openssl@3 zlib boost pkg-config)
-HOMEBREW_PREFIX="$(brew --prefix)"
-MISSING_DEPS=()
-for dep in "${BREW_DEPS[@]}"; do
-    # opt/ links exist for every installed formula, checking them is much faster than `brew list`
-    [[ -d "$HOMEBREW_PREFIX/opt/$dep" ]] || MISSING_DEPS+=("$dep")
-done
-if [[ ${#MISSING_DEPS[@]} -gt 0 ]]; then
-    info "  Installing: ${MISSING_DEPS[*]}"
-    brew install "${MISSING_DEPS[@]}" </dev/null
-else
-    info "  All dependencies already installed"
-fi
+fetch_qbittorrent() {
+    git clone -q "${QBITTORRENT_CLONE_ARGS[@]}" \
+        https://github.com/qbittorrent/qBittorrent.git "$WORKDIR/qBittorrent"
+    [[ -n "$SPOOF_VERSION" ]] || return 0
 
-OPENSSL_PREFIX="$HOMEBREW_PREFIX/opt/openssl@3"
-ZLIB_PREFIX="$HOMEBREW_PREFIX/opt/zlib"
-BOOST_PREFIX="$HOMEBREW_PREFIX/opt/boost"
-QT_BIN="$HOMEBREW_PREFIX/opt/qtbase/bin"
-# Split Qt kegs are all linked into one cmake dir, Qt6Config finds Svg/LinguistTools next to it
-QT6_DIR="$HOMEBREW_PREFIX/lib/cmake/Qt6"
-[[ -f "$QT6_DIR/Qt6Config.cmake" ]] || error "Qt CMake files missing in $QT6_DIR, run: brew link qtbase qtsvg qttools"
+    local major="${SPOOF_VERSION%%.*}"
+    local rest="${SPOOF_VERSION#*.}"
+    local minor="${rest%%.*}"
+    local bugfix="${rest#*.}"
+    local session_file="$WORKDIR/qBittorrent/src/base/bittorrent/sessionimpl.cpp"
 
-info "  Qt:      $QT6_DIR"
-info "  OpenSSL: $OPENSSL_PREFIX"
-info "  Boost:   $BOOST_PREFIX"
-
-# -----------------------------------------------------------------------------
-# Step 2: Set up work directory
-# -----------------------------------------------------------------------------
-WORKDIR="$(mktemp -d -t qbt-build)"
-trap 'cd /; rm -rf "$WORKDIR"' EXIT
-trap 'exit 130' INT TERM
-info "Step 2/5: Setting up build directory at $WORKDIR"
-cd "$WORKDIR"
-
-# Fetch qBittorrent first so a bad tag or a failed spoof patch stops before anything compiles
-git clone "${QBITTORRENT_CLONE_ARGS[@]}" \
-    https://github.com/qbittorrent/qBittorrent.git "$WORKDIR/qBittorrent"
-
-# Patch tracker-reported version if --spoof is set
-# This only changes the peer_fingerprint (peer ID) and HTTP user_agent sent to
-# trackers, the About dialog and all other UI keep showing the real version
-if [[ -n "$SPOOF_VERSION" ]]; then
-    info "  Patching tracker version to $SPOOF_VERSION..."
-    SPOOF_MAJOR="${SPOOF_VERSION%%.*}"
-    SPOOF_REST="${SPOOF_VERSION#*.}"
-    SPOOF_MINOR="${SPOOF_REST%%.*}"
-    SPOOF_BUGFIX="${SPOOF_REST#*.}"
-
-    SESSION_FILE="$WORKDIR/qBittorrent/src/base/bittorrent/sessionimpl.cpp"
-
-    # sed exits 0 even when nothing matches, so make sure upstream still has the code we patch
-    grep -qF 'generate_fingerprint(PEER_ID, QBT_VERSION_MAJOR, QBT_VERSION_MINOR, QBT_VERSION_BUGFIX, QBT_VERSION_BUILD)' "$SESSION_FILE" \
+    grep -qF 'generate_fingerprint(PEER_ID, QBT_VERSION_MAJOR, QBT_VERSION_MINOR, QBT_VERSION_BUGFIX, QBT_VERSION_BUILD)' "$session_file" \
         || error "Cannot spoof: peer fingerprint code not found in sessionimpl.cpp, upstream changed it"
-    grep -qF 'QStringLiteral("qBittorrent/" QBT_VERSION_2)' "$SESSION_FILE" \
+    grep -qF 'QStringLiteral("qBittorrent/" QBT_VERSION_2)' "$session_file" \
         || error "Cannot spoof: user agent code not found in sessionimpl.cpp, upstream changed it"
 
-    # Replace peer fingerprint: generate_fingerprint("qB", MAJOR, MINOR, BUGFIX, BUILD)
-    # with hardcoded spoofed values
     sed -i '' -E \
-        "s|generate_fingerprint\(PEER_ID, QBT_VERSION_MAJOR, QBT_VERSION_MINOR, QBT_VERSION_BUGFIX, QBT_VERSION_BUILD\)|generate_fingerprint(PEER_ID, ${SPOOF_MAJOR}, ${SPOOF_MINOR}, ${SPOOF_BUGFIX}, 0)|" \
-        "$SESSION_FILE"
-
-    # Replace user-agent: "qBittorrent/" QBT_VERSION_2 becomes "qBittorrent/SPOOF_VERSION"
+        "s|generate_fingerprint\(PEER_ID, QBT_VERSION_MAJOR, QBT_VERSION_MINOR, QBT_VERSION_BUGFIX, QBT_VERSION_BUILD\)|generate_fingerprint(PEER_ID, ${major}, ${minor}, ${bugfix}, 0)|" \
+        "$session_file"
     sed -i '' -E \
         "s|QStringLiteral\(\"qBittorrent/\" QBT_VERSION_2\)|QStringLiteral(\"qBittorrent/${SPOOF_VERSION}\")|" \
-        "$SESSION_FILE"
+        "$session_file"
+}
 
-    info "  Peer ID spoofed to: qB ${SPOOF_MAJOR}.${SPOOF_MINOR}.${SPOOF_BUGFIX}.0"
-    info "  User-Agent spoofed to: qBittorrent/${SPOOF_VERSION}"
+fetch_libtorrent() {
+    local src="$WORKDIR/libtorrent"
+    mkdir -p "$src"
+    if ! curl -fsSL --retry 3 \
+        "https://github.com/arvidn/libtorrent/releases/download/$LIBTORRENT_VERSION/libtorrent-rasterbar-${LIBTORRENT_VERSION#v}.tar.gz" \
+        | tar -xz -C "$src" --strip-components=1; then
+        echo "libtorrent release tarball unavailable, falling back to git clone"
+        rm -rf "$src"
+        git clone -q --branch "$LIBTORRENT_VERSION" --depth 1 --recurse-submodules \
+            https://github.com/arvidn/libtorrent.git "$src"
+    fi
+}
+
+fetch_boost() {
+    local major="${BOOST_VERSION%%.*}"
+    local rest="${BOOST_VERSION#*.}"
+    local minor="${rest%%.*}"
+    local patch="${rest#*.}"
+    mkdir -p "$BOOST_PREFIX/include" "$BOOST_PREFIX/lib/cmake/Boost-$BOOST_VERSION"
+    if ! curl -fsSL --retry 3 "https://github.com/boostorg/boost/releases/download/boost-$BOOST_VERSION/boost-$BOOST_VERSION-b2-nodocs.tar.xz" \
+        | tar -xJ -C "$BOOST_PREFIX/include" --strip-components=1 "boost-$BOOST_VERSION/boost"; then
+        rm -rf "$BOOST_PREFIX/include/boost"
+        curl -fsSL --retry 3 "https://archives.boost.io/release/$BOOST_VERSION/source/boost_${BOOST_VERSION//./_}.tar.gz" \
+            | tar -xz -C "$BOOST_PREFIX/include" --strip-components=1 "boost_${BOOST_VERSION//./_}/boost"
+    fi
+    [[ -f "$BOOST_PREFIX/include/boost/version.hpp" ]]
+
+    cat >"$BOOST_PREFIX/lib/cmake/Boost-$BOOST_VERSION/BoostConfig.cmake" <<EOF
+set(Boost_VERSION $BOOST_VERSION)
+set(Boost_VERSION_STRING $BOOST_VERSION)
+set(Boost_VERSION_MAJOR $major)
+set(Boost_VERSION_MINOR $minor)
+set(Boost_VERSION_PATCH $patch)
+set(Boost_MAJOR_VERSION $major)
+set(Boost_MINOR_VERSION $minor)
+set(Boost_SUBMINOR_VERSION $patch)
+set(Boost_INCLUDE_DIR "$BOOST_PREFIX/include")
+set(Boost_INCLUDE_DIRS "$BOOST_PREFIX/include")
+set(Boost_FOUND TRUE)
+if(NOT TARGET Boost::headers)
+    add_library(Boost::headers INTERFACE IMPORTED)
+    set_target_properties(Boost::headers PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "$BOOST_PREFIX/include")
+endif()
+if(NOT TARGET Boost::boost)
+    add_library(Boost::boost INTERFACE IMPORTED)
+    set_target_properties(Boost::boost PROPERTIES INTERFACE_LINK_LIBRARIES Boost::headers)
+endif()
+EOF
+    cat >"$BOOST_PREFIX/lib/cmake/Boost-$BOOST_VERSION/BoostConfigVersion.cmake" <<EOF
+set(PACKAGE_VERSION $BOOST_VERSION)
+if(PACKAGE_FIND_VERSION VERSION_GREATER PACKAGE_VERSION)
+    set(PACKAGE_VERSION_COMPATIBLE FALSE)
+else()
+    set(PACKAGE_VERSION_COMPATIBLE TRUE)
+    if(PACKAGE_FIND_VERSION VERSION_EQUAL PACKAGE_VERSION)
+        set(PACKAGE_VERSION_EXACT TRUE)
+    endif()
+endif()
+EOF
+}
+
+build_openssl() {
+    local src="$WORKDIR/openssl"
+    mkdir -p "$src"
+    curl -fsSL --retry 3 "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz" \
+        | tar -xz -C "$src" --strip-components=1
+    cd "$src"
+    ./Configure "darwin64-$ARCH-cc" no-shared no-tests no-docs no-apps no-module no-legacy \
+        no-quic no-cms no-ts no-srp no-ct no-comp no-engine no-ui-console no-ssl3 no-weak-ssl-ciphers \
+        no-idea no-mdc2 no-rc5 no-seed no-whirlpool no-camellia no-aria no-sm2 no-sm3 no-sm4 \
+        --prefix="$OPENSSL_PREFIX" --libdir=lib --openssldir=/etc/ssl
+    make -j"$NPROC" build_libs
+    make install_dev
+}
+
+install_tools() {
+    /usr/bin/python3 -m venv "$TOOLS"
+    "$TOOLS/bin/pip" install -q aqtinstall cmake ninja
+}
+
+install_qt() {
+    local latest
+    latest=$(aqt list-qt mac desktop --latest-version 2>/dev/null || true)
+    if [[ "$latest" =~ ^6\.[0-9]+\.[0-9]+$ ]]; then
+        QT_VERSION="$latest"
+    else
+        echo "Could not look up the latest Qt version, using fallback $QT_VERSION"
+    fi
+    echo "$QT_VERSION" >"$LOGS/v_qt"
+    aqt install-qt mac desktop "$QT_VERSION" clang_64 --outputdir "$WORKDIR/qt-install" \
+        --archives qtbase qtsvg qttools qttranslations qtdeclarative
+    ln -s "$WORKDIR/qt-install/$QT_VERSION/macos" "$QT_PREFIX"
+}
+
+info "Step 1/5: Fetching sources and dependencies in parallel..."
+start_job qbittorrent fetch_qbittorrent
+start_job libtorrent-src fetch_libtorrent
+start_job boost fetch_boost
+start_job openssl build_openssl
+start_job tools install_tools
+
+wait_job qbittorrent
+if [[ -n "$SPOOF_VERSION" ]]; then
+    info "  Tracker version patched: peer ID qB ${SPOOF_VERSION}.0, user agent qBittorrent/${SPOOF_VERSION}"
 fi
+wait_job tools
+start_job qt install_qt
+wait_job libtorrent-src
+wait_job boost
+info "  Boost $BOOST_VERSION headers ready"
 
-# -----------------------------------------------------------------------------
-# Step 3: Build libtorrent-rasterbar (static)
-# -----------------------------------------------------------------------------
-info "Step 3/5: Building libtorrent-rasterbar $LIBTORRENT_VERSION (static)..."
+CMAKE_COMMON=(
+    -G Ninja
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_OSX_ARCHITECTURES="$ARCH"
+    -DCMAKE_IGNORE_PREFIX_PATH="/opt/homebrew;/usr/local;/opt/local"
+    -DCMAKE_FIND_USE_PACKAGE_REGISTRY=OFF
+)
 
-# The release tarball already includes submodules and is far smaller than a recursive clone
-LT_TARBALL="https://github.com/arvidn/libtorrent/releases/download/$LIBTORRENT_VERSION/libtorrent-rasterbar-${LIBTORRENT_VERSION#v}.tar.gz"
-mkdir -p "$WORKDIR/libtorrent"
-if ! curl -fsSL --retry 3 "$LT_TARBALL" | tar -xz -C "$WORKDIR/libtorrent" --strip-components=1; then
-    warn "libtorrent release tarball unavailable, falling back to git clone"
-    rm -rf "$WORKDIR/libtorrent"
-    git clone --branch "$LIBTORRENT_VERSION" --depth 1 --recurse-submodules \
-        https://github.com/arvidn/libtorrent.git "$WORKDIR/libtorrent"
-fi
+wait_job openssl
+info "  OpenSSL $OPENSSL_VERSION built"
 
-# -w silences libtorrent's -Weverything, which otherwise floods the terminal with ~1000 warnings
+info "Step 2/5: Building libtorrent-rasterbar $LIBTORRENT_VERSION (static)..."
 cmake -S "$WORKDIR/libtorrent" -B "$WORKDIR/libtorrent/build" \
-    -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
+    "${CMAKE_COMMON[@]}" \
     -DCMAKE_CXX_STANDARD=20 \
     -DCMAKE_CXX_FLAGS="-w" \
-    -DCMAKE_INSTALL_PREFIX="$WORKDIR/libtorrent-install" \
+    -DCMAKE_INSTALL_PREFIX="$LT_PREFIX" \
     -DCMAKE_PREFIX_PATH="$OPENSSL_PREFIX;$BOOST_PREFIX" \
+    -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX" \
     -DBUILD_SHARED_LIBS=OFF \
-    -Ddeprecated-functions=OFF
-
+    -Ddeprecated-functions=OFF \
+    >"$LOGS/libtorrent-configure.log" 2>&1 \
+    || { tail -25 "$LOGS/libtorrent-configure.log" >&2; error "libtorrent configure failed"; }
 cmake --build "$WORKDIR/libtorrent/build" --parallel "$NPROC"
-cmake --install "$WORKDIR/libtorrent/build"
+cmake --install "$WORKDIR/libtorrent/build" >/dev/null
 
-# -----------------------------------------------------------------------------
-# Step 4: Build qBittorrent
-# -----------------------------------------------------------------------------
-info "Step 4/5: Building qBittorrent ($info_branch)..."
+wait_job qt
+QT_VERSION=$(cat "$LOGS/v_qt")
+info "  Qt $QT_VERSION ready"
+[[ -f "$QT_PREFIX/lib/cmake/Qt6/Qt6Config.cmake" ]] || error "Qt CMake files missing in $QT_PREFIX"
 
-# libtorrent-install goes first so a Homebrew libtorrent-rasterbar never wins, and the Homebrew
-# prefix itself stays out so /opt/homebrew/lib/libssl (possibly openssl@4) is not picked up
+info "Step 3/5: Building qBittorrent ($info_branch)..."
 cmake -S "$WORKDIR/qBittorrent" -B "$WORKDIR/qBittorrent/build" \
-    -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="$WORKDIR/libtorrent-install;$OPENSSL_PREFIX;$BOOST_PREFIX;$ZLIB_PREFIX" \
-    -DQt6_DIR="$QT6_DIR" \
+    "${CMAKE_COMMON[@]}" \
+    -DCMAKE_PREFIX_PATH="$LT_PREFIX;$OPENSSL_PREFIX;$BOOST_PREFIX;$QT_PREFIX" \
+    -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX" \
     -DGUI=ON \
-    -DTESTING=OFF
-
+    -DTESTING=OFF \
+    >"$LOGS/qbittorrent-configure.log" 2>&1 \
+    || { tail -25 "$LOGS/qbittorrent-configure.log" >&2; error "qBittorrent configure failed"; }
 cmake --build "$WORKDIR/qBittorrent/build" --parallel "$NPROC"
 
 APP_PATH="$WORKDIR/qBittorrent/build/qbittorrent.app"
+[[ -d "$APP_PATH" ]] || error "Build failed, qbittorrent.app not found at $APP_PATH"
 
-if [[ ! -d "$APP_PATH" ]]; then
-    error "Build failed, qbittorrent.app not found at $APP_PATH"
-fi
+info "Step 4/5: Bundling Qt into the app..."
 
-info "  Build successful: $APP_PATH"
-
-# -----------------------------------------------------------------------------
-# Step 5: Bundle into standalone .app
-# -----------------------------------------------------------------------------
-info "Step 5/5: Bundling with macdeployqt and ad-hoc signing..."
-
-# Deploy only the plugins qBittorrent uses. Left alone, macdeployqt copies every plugin in Homebrew's
-# shared plugin dir and cannot resolve split-keg frameworks like QtSvg, so the app falls back to /opt/homebrew
-QT_PLUGINS="$("$QT_BIN/qtpaths6" --query QT_INSTALL_PLUGINS)"
 QT_PLUGIN_LIST=(
     platforms/libqcocoa
     styles/libqmacstyle
@@ -267,25 +375,36 @@ QT_PLUGIN_LIST=(
     imageformats/libqicns
     imageformats/libqjpeg
     imageformats/libqgif
-    tls/libqopensslbackend
     tls/libqsecuretransportbackend
     tls/libqcertonlybackend
     sqldrivers/libqsqlite
     networkinformation/libqapplenetworkinformation
 )
-[[ -f "$QT_PLUGINS/platforms/libqcocoa.dylib" ]] || error "Qt cocoa platform plugin not found in $QT_PLUGINS"
+[[ -f "$QT_PREFIX/plugins/platforms/libqcocoa.dylib" ]] || error "Qt cocoa platform plugin not found in $QT_PREFIX/plugins"
 DEPLOY_ARGS=()
 for plugin in "${QT_PLUGIN_LIST[@]}"; do
-    src="$QT_PLUGINS/$plugin.dylib"
+    src="$QT_PREFIX/plugins/$plugin.dylib"
     [[ -f "$src" ]] || continue
     mkdir -p "$APP_PATH/Contents/PlugIns/${plugin%/*}"
     install -m 644 "$src" "$APP_PATH/Contents/PlugIns/$plugin.dylib"
     DEPLOY_ARGS+=("-executable=$APP_PATH/Contents/PlugIns/$plugin.dylib")
 done
 
-"$QT_BIN/macdeployqt" "$APP_PATH" -no-plugins -no-strip -no-codesign "${DEPLOY_ARGS[@]}"
+"$QT_PREFIX/bin/macdeployqt" "$APP_PATH" -no-plugins -no-strip -no-codesign "${DEPLOY_ARGS[@]}" \
+    >"$LOGS/macdeployqt.log" 2>&1 \
+    || { tail -25 "$LOGS/macdeployqt.log" >&2; error "macdeployqt failed"; }
 
-# One deep ad-hoc sign instead of macdeployqt spawning codesign per binary
+if otool -L "$APP_PATH/Contents/MacOS/qbittorrent" "$APP_PATH"/Contents/PlugIns/*/*.dylib \
+    | grep -E "^[[:space:]]+(/opt/homebrew|/usr/local|/opt/local|$WORKDIR)" >&2; then
+    error "The app links against libraries outside the bundle (listed above)"
+fi
+
+info "Step 5/5: Thinning, signing and moving the app..."
+while IFS= read -r -d '' bin; do
+    if [[ "$(lipo -archs "$bin" 2>/dev/null)" == *" "* ]]; then
+        lipo -thin "$ARCH" "$bin" -output "$bin.thin" && mv "$bin.thin" "$bin"
+    fi
+done < <(find "$APP_PATH/Contents" -type f -print0)
 xattr -cr "$APP_PATH"
 codesign --force --deep --sign - "$APP_PATH"
 codesign --verify --deep --strict "$APP_PATH"
@@ -294,19 +413,15 @@ FINAL_APP="$OUTPUT_DIR/qBittorrent.app"
 rm -rf "$FINAL_APP"
 mv "$APP_PATH" "$FINAL_APP"
 
-# -----------------------------------------------------------------------------
-# Done!
-# -----------------------------------------------------------------------------
 ELAPSED=$(( $(date +%s) - START_TIME ))
-MINS=$(( ELAPSED / 60 ))
-SECS=$(( ELAPSED % 60 ))
 
 echo ""
 info "========================================"
-info "  Build complete! (${MINS}m ${SECS}s)"
+info "  Build complete! ($(( ELAPSED / 60 ))m $(( ELAPSED % 60 ))s)"
 info "========================================"
 info ""
 info "  .app: $FINAL_APP"
+info "  Qt $QT_VERSION, libtorrent $LIBTORRENT_VERSION, OpenSSL $OPENSSL_VERSION, Boost $BOOST_VERSION"
 if [[ -n "$SPOOF_VERSION" ]]; then
     info "  Tracker version: $SPOOF_VERSION (spoofed)"
 fi
@@ -314,7 +429,6 @@ info ""
 info "  To install:"
 info "    rm -rf /Applications/qBittorrent.app && cp -R \"$FINAL_APP\" /Applications/"
 info ""
-# The EXIT trap removes the build directory
 
 }
 
